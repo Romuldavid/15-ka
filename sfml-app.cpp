@@ -4,6 +4,7 @@ using namespace sf;
 int main()
 {
     RenderWindow window(VideoMode(512, 512), "15-ka");
+    window.setFramerateLimit(60);
 
     Texture t;
     t.loadFromFile("Paint/15.png");
@@ -66,6 +67,16 @@ int main()
                     n = grid[x][y];
                     grid[x][y] = 16;
                     grid[x + dx][y + dy] = n;
+
+                    s[16].move(-dx * w, -dy * w);
+                    float speed = 16;
+                    for(int i = 0; i < w; i += speed)
+                    {
+                        s[n].move(speed * dx, speed * dy);
+                        window.draw(s[16]);
+                        window.draw(s[n]);
+                        window.display();
+                    }
                 }
         }
 
