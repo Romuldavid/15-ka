@@ -34,7 +34,7 @@ def implied_volatility(market_price, S, K, T, r, option_type='call'):
             high = mid
     return (low + high) / 2.0
 
-class BullSpreadAnalyzer:
+class SeparateRegimeAnalyzer:
     def __init__(self, db_path="moex_market_data.db", cbr_path="cbr_key_rate.csv", initial_capital=1000000.0):
         self.db_path = db_path
         self.initial_capital = initial_capital
@@ -64,11 +64,12 @@ class BullSpreadAnalyzer:
                 return None
         return None
 
-    def run_analysis(self):
+    def run_regimes(self):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
 
-        results = []
+        call_debit_results = []
+        put_credit_results = []
 
         for prefix in self.prefixes:
             c.execute("SELECT tradedate, secid, close, volume, numtrades FROM options_ohlc WHERE secid LIKE ? ORDER BY tradedate", (f"{prefix}%",))
@@ -115,8 +116,10 @@ class BullSpreadAnalyzer:
                 spot_df['iv'].rolling(30, min_periods=5).max() - spot_df['iv'].rolling(30, min_periods=5).min() + 1e-6
             )
 
-            trades_base, win_base, pnl_base = 0, 0, 0.0
-            trades_opt, win_opt, pnl_opt = 0, 0, 0.0
+            # 1. Bull Call Spread (Debit Spread, Low IV Rank <= 50%)
+            call_trades, call_wins, call_pnl = 0, 0, 0.0
+            # 2. Bull Put Spread (Credit Spread, High IV Rank > 50%)
+            put_trades, put_wins, put_pnl = 0, 0, 0.0
 
             for idx in range(0, len(trading_dates) - 10, 5):
                 d_str = trading_dates[idx]
@@ -124,6 +127,9 @@ class BullSpreadAnalyzer:
                 opts = opts_by_date[d_str]
                 is_bullish = spot_df.loc[idx, 'trend']
                 iv_rank = spot_df.loc[idx, 'iv_rank']
+
+                if not is_bullish:
+                    continue # Both require bullish trend
 
                 strikes = sorted(list(set(o['strike'] for o in opts)))
                 if len(strikes) < 2:
@@ -140,125 +146,127 @@ class BullSpreadAnalyzer:
                 opt2 = next((o for o in opts if abs(o['strike'] - K2) < 1e-4), None)
 
                 if opt1 and opt2:
-                    debit = opt1['close'] - opt2['close']
-                    if 0 < debit < (K2 - K1):
-                        exp_idx = min(idx + 10, len(trading_dates) - 1)
-                        exp_spot = spot_prices[exp_idx]
-                        payoff = max(0.0, exp_spot - K1) - max(0.0, exp_spot - K2)
-                        pnl = payoff - debit
+                    exp_idx = min(idx + 10, len(trading_dates) - 1)
+                    exp_spot = spot_prices[exp_idx]
 
-                        trades_base += 1
-                        pnl_base += pnl
-                        if pnl > 0:
-                            win_base += 1
-
-                        if is_bullish and (pd.isna(iv_rank) or iv_rank <= 0.65):
-                            trades_opt += 1
-                            pnl_opt += pnl
+                    # Low IV: Bull Call Debit Spread
+                    if pd.isna(iv_rank) or iv_rank <= 0.50:
+                        debit = opt1['close'] - opt2['close']
+                        if 0 < debit < (K2 - K1):
+                            payoff = max(0.0, exp_spot - K1) - max(0.0, exp_spot - K2)
+                            pnl = payoff - debit
+                            call_trades += 1
+                            call_pnl += pnl
                             if pnl > 0:
-                                win_opt += 1
+                                call_wins += 1
 
-            results.append({
+                    # High IV: Bull Put Credit Spread
+                    elif iv_rank > 0.50:
+                        # Sell Put K2, Buy Put K1
+                        # Estimate Put prices using Put-Call Parity if explicit puts not isolated
+                        # Credit received = P_K2 - P_K1
+                        credit = (opt2['close'] - spot + K2) - (opt1['close'] - spot + K1)
+                        if credit > 0:
+                            loss = max(0.0, K2 - exp_spot) - max(0.0, K1 - exp_spot)
+                            pnl = credit - loss
+                            put_trades += 1
+                            put_pnl += pnl
+                            if pnl > 0:
+                                put_wins += 1
+
+            call_debit_results.append({
                 'prefix': prefix,
-                'trades_base': trades_base,
-                'win_rate_base': (win_base / trades_base * 100) if trades_base > 0 else 0.0,
-                'pnl_base': pnl_base,
-                'trades_opt': trades_opt,
-                'win_rate_opt': (win_opt / trades_opt * 100) if trades_opt > 0 else 0.0,
-                'pnl_opt': pnl_opt
+                'trades': call_trades,
+                'win_rate': (call_wins / call_trades * 100) if call_trades > 0 else 0.0,
+                'pnl': call_pnl
+            })
+
+            put_credit_results.append({
+                'prefix': prefix,
+                'trades': put_trades,
+                'win_rate': (put_wins / put_trades * 100) if put_trades > 0 else 0.0,
+                'pnl': put_pnl
             })
 
         conn.close()
-        return results
+        return call_debit_results, put_credit_results
 
-def generate_report_and_chart(results):
-    df = pd.DataFrame(results)
+def generate_individual_reports(call_results, put_results):
+    df_call = pd.DataFrame(call_results)
+    df_put = pd.DataFrame(put_results)
 
-    # Plot Comparison Chart
-    plt.figure(figsize=(12, 6))
-    bar_width = 0.35
-    x = np.arange(len(df['prefix']))
+    # 1. Bull Call Debit Spread Report
+    total_call_pnl = df_call['pnl'].sum()
+    avg_call_win = df_call['win_rate'].mean()
+    call_report = f"""# Отчет по стратегии «Bull Call Spread (Дебетовый бычий спрэд)»
 
-    plt.bar(x - bar_width/2, df['pnl_base'], width=bar_width, label='Базовая стратегия (Без фильтров)', color='lightcoral')
-    plt.bar(x + bar_width/2, df['pnl_opt'], width=bar_width, label='Оптимизированная стратегия (Фильтр Тренда + IV Rank)', color='mediumseagreen')
-
-    plt.title("Сравнение Доходности Бычьего Спрэда по Инструментам MOEX (2023-2026)", fontsize=14)
-    plt.xlabel("Инструмент (Префикс)", fontsize=12)
-    plt.ylabel("PnL (Пункты / Рубли)", fontsize=12)
-    plt.xticks(x, df['prefix'], rotation=45)
-    plt.grid(True, linestyle=':', alpha=0.6)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("bull_spread_chart.png", dpi=300)
-    plt.close()
-    print("Saved bull_spread_chart.png")
-
-    # Generate Markdown Report
-    total_pnl_base = df['pnl_base'].sum()
-    total_pnl_opt = df['pnl_opt'].sum()
-    avg_win_base = df['win_rate_base'].mean()
-    avg_win_opt = df['win_rate_opt'].mean()
-
-    report = f"""# Отчет по анализу и оптимизации стратегии «Бычий Спрэд» (Bull Spread)
-
-## 1. Исполнительное резюме
-На основе реальных биржевых цен Московской биржи (MOEX) за период **01.01.2023 — 08.09.2026** проведен комплексный бэктест и факторный анализ стратегии **Бычий Спрэд (Bull Call Spread / Bull Put Spread)**.
-
-### Сравнительные результаты:
-- **Базовая стратегия (без фильтров):**
-  - Суммарный PnL: `{total_pnl_base:,.2f} РУБ`
-  - Средний Win Rate: `{avg_win_base:.2f}%`
-- **Оптимизированная стратегия (с фильтрами Тренда и Волатильности):**
-  - Суммарный PnL: `{total_pnl_opt:,.2f} РУБ`
-  - Средний Win Rate: `{avg_win_opt:.2f}%`
-  - **Прирост доходности:** `+{(total_pnl_opt - total_pnl_base):,.2f} РУБ`
+## 1. Резюме стратегии
+- **Режим рынка:** Низкая волатильность (**IV Rank <= 50%**) и бычий тренд (Цена > EMA-20)
+- **Конструкция:** Покупка ATM Call (K1) + Продажа OTM Call (K2)
+- **Характер позиции:** Чистый дебет (платится премия), чистая положительная дельта (Long Delta)
+- **Суммарный PnL по MOEX:** `{total_call_pnl:,.2f} РУБ`
+- **Средний Win Rate:** `{avg_call_win:.2f}%`
 
 ---
 
-## 2. Результаты Бэктеста по Инструментам
+## 2. Результаты по Инструментам MOEX (01.01.2023 — 08.09.2026)
 
-| Инструмент | Сделок (База) | Win Rate (База) | PnL База (РУБ) | Сделок (Оптим.) | Win Rate (Оптим.) | PnL Оптим. (РУБ) |
-|------------|---------------|-----------------|----------------|-----------------|-------------------|------------------|
+| Инструмент | Число сделок | Win Rate (%) | PnL (РУБ) |
+|------------|--------------|--------------|-----------|
 """
-    for _, r in df.iterrows():
-        report += f"| {r['prefix']} | {r['trades_base']} | {r['win_rate_base']:.1f}% | {r['pnl_base']:,.2f} | {r['trades_opt']} | {r['win_rate_opt']:.1f}% | {r['pnl_opt']:,.2f} |\n"
+    for _, r in df_call.iterrows():
+        call_report += f"| {r['prefix']} | {r['trades']} | {r['win_rate']:.1f}% | {r['pnl']:,.2f} |\n"
 
-    report += """
+    call_report += """
 ---
 
-## 3. Ключевые Признаки, Повышающие Доходность Стратегии
-
-### 1. Фильтр Тренда Базового Актива (Trend Direction)
-- **Принцип:** Открытие бычьего спрэда строго при нахождении цены базового актива выше своей **20-дневной экспоненциальной средней (EMA-20)**.
-- **Обоснование:** Отсекаются сделки в контртренд на падающих рынках, что предотвращает сильные убытки при покупке Call-спрэдов.
-
-### 2. Фильтр Волатильности (IV Rank / IV Percentile)
-- **Принцип:** Вход в **Bull Call Spread** рекомендуется при низком или умеренном уровне IV Rank (`<= 60%`), когда купленный опцион не переоценен.
-- **Обоснование:** Покупка опционов при аномально высокой волатильности ведет к «сжатию волатильности» (IV Crush), уменьшая итоговый PnL. Для высокой IV предпочтительнее **Bull Put Spread (кредитный спрэд)**.
-
-### 3. Оптимизация Ширины Спрэда и Moneyness (Страйков)
-- **Принцип:** Покупка ATM Call (At-The-Money) и продажа OTM Call (Out-Of-The-Money) с дельтой второго опциона порядка `0.25–0.30`.
-- **Обоснование:** Обеспечивает оптимальное соотношение риск/прибыль (Risk/Reward ratio порядка 1:2 или 1:2.5).
-
-### 4. Управление Сроком До Экспирации (DTE)
-- **Принцип:** Оптимальный горизонт входа составляет **15–30 дней до экспирации**.
-- **Обоснование:** Позволяет сбалансировать временной распад (Theta) и дать базовому активу достаточно времени для реализации направленного движения.
-
----
-
-## 4. Итоговые Рекомендации
-1. **Сочетать фильтры тренда и волатильности:** Добавление технического фильтра тренда и IV Rank увеличивает Win Rate и существенно снижает максимальную просадку.
-2. **Переключение режимов:** При низкой IV открывать **Bull Call Spread (дебетовый)**, при высокой IV — **Bull Put Spread (кредитный)**.
+## 3. Выводы по Дебетовому Бычьему Спрэду
+1. **Преимущества:** Ограниченный риск (не больше уплаченного дебета) и высокий Leverage при низких ценах на покупку опционов.
+2. **Ключевой фактор успеха:** Входить только в фазах низкой волатильности, чтобы избежать падения стоимости опционов от Vega-распада при падении IV.
 """
 
-    with open("bull_spread_report.md", "w", encoding="utf-8") as f:
-        f.write(report)
-    print("Saved bull_spread_report.md")
+    with open("bull_call_debit_report.md", "w", encoding="utf-8") as f:
+        f.write(call_report)
+    print("Saved bull_call_debit_report.md")
+
+    # 2. Bull Put Credit Spread Report
+    total_put_pnl = df_put['pnl'].sum()
+    avg_put_win = df_put['win_rate'].mean()
+    put_report = f"""# Отчет по стратегии «Bull Put Spread (Кредитный бычий спрэд)»
+
+## 1. Резюме стратегии
+- **Режим рынка:** Высокая волатильность (**IV Rank > 50%**) и бычий тренд (Цена > EMA-20)
+- **Конструкция:** Продажа OTM Put (K2) + Покупка дальше OTM Put (K1)
+- **Характер позиции:** Чистый кредит (получается премия), положительный Theta (заработок на распаде времени)
+- **Суммарный PnL по MOEX:** `{total_put_pnl:,.2f} РУБ`
+- **Средний Win Rate:** `{avg_put_win:.2f}%`
+
+---
+
+## 2. Результаты по Инструментам MOEX (01.01.2023 — 08.09.2026)
+
+| Инструмент | Число сделок | Win Rate (%) | PnL (РУБ) |
+|------------|--------------|--------------|-----------|
+"""
+    for _, r in df_put.iterrows():
+        put_report += f"| {r['prefix']} | {r['trades']} | {r['win_rate']:.1f}% | {r['pnl']:,.2f} |\n"
+
+    put_report += """
+---
+
+## 3. Выводы по Кредитному Бычьему Спрэду
+1. **Преимущества:** Высокая вероятность успеха (Win Rate), прибыль зарабатывается за счет временного распада (Theta) и «сжатия» волатильности (IV Crush).
+2. **Ключевой фактор успеха:** Продавать дорогую волатильность на пиках IV с обязательной защитой купленным страйком ниже.
+"""
+
+    with open("bull_put_credit_report.md", "w", encoding="utf-8") as f:
+        f.write(put_report)
+    print("Saved bull_put_credit_report.md")
 
 def main():
-    analyzer = BullSpreadAnalyzer()
-    res = analyzer.run_analysis()
-    generate_report_and_chart(res)
+    analyzer = SeparateRegimeAnalyzer()
+    call_res, put_res = analyzer.run_regimes()
+    generate_individual_reports(call_res, put_res)
 
 if __name__ == "__main__":
     main()
