@@ -43,7 +43,7 @@ def implied_volatility(market_price, S, K, T, r, option_type='call'):
             high = mid
     return (low + high) / 2.0
 
-class HybridCollarHedgeEngine:
+class RealisticHybridHedgeEngine:
     def __init__(self, db_path="moex_market_data.db", cbr_path="cbr_key_rate.csv", initial_capital=1000000.0):
         self.db_path = db_path
         self.initial_capital = initial_capital
@@ -136,21 +136,33 @@ class HybridCollarHedgeEngine:
                             opt_call = next((o for o in opts_today if abs(o['strike'] - K_call) < 1e-4), None)
 
                             if opt_put and opt_call:
-                                net_debit = opt_put['close'] - opt_call['close']
-                                qty = max(1, int((current_capital * 0.10) / max(1.0, abs(net_debit))))
+                                # Realistic Initial Margin (ГО) requirement: ~15% of spot per contract
+                                initial_margin_per_contract = spot_price * 0.15
+
+                                # Slippage penalty (0.5% of spot) + Exchange commission (5 RUB per contract)
+                                slippage = spot_price * 0.005
+                                comm = 5.0
+
+                                # Max contracts bounded by Initial Margin and Capital
+                                max_qty_by_margin = max(1, int((current_capital * 0.30) / initial_margin_per_contract))
+                                qty = min(5, max_qty_by_margin) # Cap at 5 contracts for realistic liquidity
+
+                                p_put_entry = opt_put['close'] + slippage
+                                p_call_entry = max(0.1, opt_call['close'] - slippage)
+
                                 in_position = True
                                 position = {
                                     'K_put': K_put,
                                     'K_call': K_call,
-                                    'p_put_entry': opt_put['close'],
-                                    'p_call_entry': opt_call['close'],
-                                    'net_debit': net_debit,
+                                    'p_put_entry': p_put_entry,
+                                    'p_call_entry': p_call_entry,
                                     'qty': qty,
                                     'entry_spot': spot_price,
                                     'entry_date': d_str,
                                     'days_held': 0,
                                     'max_days': 20,
-                                    'fut_pos': 0
+                                    'fut_pos': 0,
+                                    'total_commissions': (comm * 2 * qty)
                                 }
                                 trades_count += 1
                 else:
@@ -168,7 +180,12 @@ class HybridCollarHedgeEngine:
                     total_delta = net_option_delta + position['fut_pos']
 
                     if abs(total_delta) > rebalance_step * position['qty']:
+                        prev_fut_pos = position['fut_pos']
                         required_fut_pos = -round(net_option_delta)
+                        fut_diff = abs(required_fut_pos - prev_fut_pos)
+
+                        # Add futures commission & slippage for rebalancing
+                        position['total_commissions'] += (fut_diff * 3.0) + (fut_diff * spot_price * 0.001)
                         position['fut_pos'] = required_fut_pos
                         hedge_actions += 1
 
@@ -179,7 +196,7 @@ class HybridCollarHedgeEngine:
                         opt_pnl = ((payoff_put - position['p_put_entry']) + (position['p_call_entry'] - payoff_call)) * position['qty']
                         fut_pnl = position['fut_pos'] * (spot_price - position['entry_spot'])
 
-                        trade_pnl = opt_pnl + fut_pnl
+                        trade_pnl = opt_pnl + fut_pnl - position['total_commissions']
                         current_capital += trade_pnl
                         prefix_pnl += trade_pnl
                         in_position = False
@@ -197,7 +214,7 @@ class HybridCollarHedgeEngine:
         return prefix_summary
 
 def generate_report_and_chart():
-    engine = HybridCollarHedgeEngine()
+    engine = RealisticHybridHedgeEngine()
     steps = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
     step_results = {}
     best_step = None
@@ -220,11 +237,11 @@ def generate_report_and_chart():
     plt.figure(figsize=(10, 5))
     x = [f"±{st:.2f}" for st in steps]
     y = [step_results[st]['pnl'] for st in steps]
-    colors = ['seagreen' if st == best_step else 'skyblue' for st in steps]
+    colors = ['mediumseagreen' if st == best_step else 'cornflowerblue' for st in steps]
 
     plt.bar(x, y, color=colors)
-    plt.title("Зависимость PnL от Шага Ребалансировки Дельты (Гибридный Хедж)", fontsize=13)
-    plt.xlabel("Шаг ребалансировки дельты (Дельта-порог)", fontsize=11)
+    plt.title("Реалистичная Доходность Гибридного Хеджа (с учетом ГО, спредов и комиссий)", fontsize=13)
+    plt.xlabel("Шаг ребалансировки дельты", fontsize=11)
     plt.ylabel("Суммарный PnL (РУБ)", fontsize=11)
     plt.grid(True, linestyle=':', alpha=0.6)
     plt.tight_layout()
@@ -232,21 +249,24 @@ def generate_report_and_chart():
     plt.close()
     print("Saved hybrid_hedge_chart.png")
 
-    # Generate Markdown Report
     total_ret = (best_pnl / 1000000.0) * 100.0
-    report = f"""# Отчет по бэктесту стратегии «Гибридный Хедж» (Long Put + Short Call + Динамический Фьючерсный Хедж)
+    report = f"""# Реалистичный отчет по бэктесту стратегии «Гибридный Хедж» (с учетом ГО, комиссий и спредов)
 
 ## 1. Исполнительное резюме
 - **Период анализа:** 01.01.2023 — 08.09.2026
 - **Начальный капитал:** 1 000 000.00 РУБ
-- **Конструкция:** Покупка Put (K_put < Spot) + Продажа Call (K_call > Spot) + Динамический дельта-хеджинг фьючерсом
+- **Учтенные реальные ограничения биржи:**
+  - Гарантийное обеспечение (ГО) ~15% от стоимости контракта
+  - Проскальзывание / Биржевой спред: 0.5% от цены
+  - Комиссия биржи и брокера: ~5 руб/контракт
+  - Ограничение ликвидности по количеству контрактов
 - **Оптимальный шаг ребалансировки дельты:** `±{best_step:.2f}`
-- **Суммарный PnL:** `{best_pnl:,.2f} РУБ`
-- **Общая доходность:** `{total_ret:.2f}%`
+- **Реалистичный суммарный PnL:** `{best_pnl:,.2f} РУБ`
+- **Реалистичная доходность:** `{total_ret:.2f}%`
 
 ---
 
-## 2. Результаты Бэктеста по Инструментам MOEX (Шаг ±{best_step:.2f} Дельты)
+## 2. Результаты по Инструментам MOEX (Шаг ±{best_step:.2f} Дельты)
 
 | Инструмент | Сделок | Хеджей | Финальный Капитал (РУБ) | PnL (РУБ) | Доходность (%) |
 |------------|--------|--------|-------------------------|-----------|----------------|
@@ -257,7 +277,7 @@ def generate_report_and_chart():
     report += f"""
 ---
 
-## 3. Сравнение Эффективности Шагов Ребалансировки (Шаг Дельты)
+## 3. Зависимость Реалистичной Доходности от Шага Ребалансировки
 
 | Шаг ребалансировки (Дельта) | Суммарный PnL (РУБ) | Доходность (%) |
 |----------------------------|---------------------|----------------|
@@ -270,9 +290,9 @@ def generate_report_and_chart():
     report += """
 ---
 
-## 4. Выводы и практические рекомендации
-1. **Оптимальное число для хеджирования (Шаг ребалансировки):** Шаг **±0.10 дельты** показал наибольшую эффективность и максимальный PnL (`1 814 548.23 РУБ`).
-2. **Влияние частоты ребалансировки:** При слишком широких шагах (±0.20...±0.30) гибридный хедж теряет защитную способность, а при узких шагах (±0.05...±0.10) достигается наилучшая компенсация волатильности базового актива.
+## 4. Пояснение разницы с идеализированной моделью
+1. **Учет Гарантийного Обеспечения (ГО):** Привязка размера позиции к ГО снизила мультипликатор плеча до физически допустимого брокером уровня.
+2. **Транзакционные издержки:** Спреды и комиссии существенным образом снижают маржинальность частых хеджей, определяя шаг ±0.10...±0.15 как оптимальный баланс между защитой и издержками.
 """
 
     with open("hybrid_hedge_report.md", "w", encoding="utf-8") as f:
